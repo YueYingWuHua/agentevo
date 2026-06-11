@@ -9,15 +9,24 @@ ReAct Agent 实现
   2. Action:   调用工具
   3. Observation: 获取工具结果，成为下一轮 Thought 的输入
 
+支持两种 LLM 输出模式：
+  --batch（默认）: 非流式，LLM 完整生成后解析 Action
+  --stream:        流式，LLM 逐 token 输出，实时展示推理过程，
+                   检测到 Action 后立即执行工具
+
 支持人工参与模式：当需要真实环境反馈时，可暂停等待人工输入 Observation。
 
-运行方式：python react_agent.py
+运行方式：
+  python react_agent.py                # 默认 Batch 模式
+  python react_agent.py --stream       # Stream 模式
+  python react_agent.py --stream --human-in-loop  # Stream + 人工参与
 
 API 模式：
   设置环境变量 OPENAI_API_KEY 后自动切换为真实 LLM 驱动模式
-  未设置时使用内置的模拟推理逻辑
+  未设置时使用内置的模拟推理逻辑（Stream 模式也会模拟逐字输出）
 """
 
+import argparse
 import json
 import os
 import re
@@ -26,7 +35,7 @@ from typing import Any
 
 # 导入共享模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from llm_client import chat_structured, is_available as llm_available
+from llm_client import chat, chat_structured, chat_stream, is_available as llm_available
 
 # ── 工具集 ───────────────────────────────────────────────────
 def search(query: str) -> str:
@@ -123,6 +132,95 @@ REACT_STRUCTURED_PROMPT = """你是一个 ReAct Agent。你必须严格输出 JS
 3. 当有足够信息回答时，type=final"""
 
 
+# ── Stream 模式的 System Prompt ─────────────────────────────
+
+REACT_STREAM_PROMPT = """你是一个 ReAct Agent。请用中文自然语言进行推理。
+
+可用工具：
+- search(query: str) → 搜索信息
+- read_file(path: str) → 读取文件内容
+- write_file(path: str, content: str) → 写入文件
+- calculate(expression: str) → 计算数学表达式
+
+规则：
+1. 先用自然语言描述你的思考过程（用户能看到你"想"的过程）
+2. 如果需要调用工具，在末尾加标签：
+   <ACTION>工具名</ACTION>
+   <ARGS>{"参数名":"参数值"}</ARGS>
+3. 如果不需要调工具、有足够信息回答，直接给出最终答案
+4. 每次只选一个工具，不要一次输出多个 Action"""
+
+
+def react_llm_stream_think(messages: list[dict], task: str, step: int,
+                           last_observation: str) -> dict | None:
+    """
+    ReAct Stream 模式的推理。
+    通过 chat_stream() 逐 token 打印 LLM 输出，结束后解析 Action 标签。
+    如果 API 不可用，chat_stream() 内部自动回退到模拟流式输出。
+    """
+    stream_messages = [
+        {"role": "system", "content": REACT_STREAM_PROMPT},
+        {"role": "user", "content": f"任务: {task}"},
+    ]
+    for h in messages:
+        if h["role"] != "system":
+            stream_messages.append(h)
+    if last_observation:
+        stream_messages.append({"role": "user",
+            "content": f"上一步 Observation: {last_observation}\n请决定下一步（step {step}）。"})
+    else:
+        stream_messages.append({"role": "user",
+            "content": f"请开始第一步（step {step}）。"})
+
+    # ── 流式输出 ──
+    print("  💭 ", end="", flush=True)
+    gen = chat_stream(stream_messages, temperature=0.3)
+
+    accumulated = ""
+    for token in gen:
+        print(token, end="", flush=True)
+        accumulated += token
+    print()  # 流结束后换行
+
+    # gen.value 在生成器 return 后才可用
+    full_text, tool_calls = gen.value if hasattr(gen, 'value') else (accumulated, None)
+
+    # ── 优先使用 API 返回的 tool_calls（原生 Function Calling） ──
+    if tool_calls:
+        print(f"  🌐 [Stream → 检测到 Function Call]")
+        return {
+            "thought": full_text,
+            "type": "action",
+            "action": tool_calls["name"],
+            "action_input": tool_calls.get("arguments", "{}"),
+        }
+
+    # ── 回退：从文本中解析 <ACTION> 标签 ──
+    text_to_parse = full_text or accumulated
+    action_match = re.search(r'<ACTION>(.*?)</ACTION>', text_to_parse)
+    if action_match:
+        action_name = action_match.group(1).strip()
+        args_match = re.search(r'<ARGS>(.*?)</ARGS>', text_to_parse)
+        action_args = args_match.group(1).strip() if args_match else "{}"
+
+        print(f"  🌐 [Stream → 检测到 Action 标签]")
+        return {
+            "thought": text_to_parse,
+            "type": "action",
+            "action": action_name,
+            "action_input": action_args,
+        }
+
+    # ── 无工具调用标签 → 视为最终答案 ──
+    print(f"  🌐 [Stream → 判定为最终答案]")
+    return {
+        "thought": text_to_parse,
+        "type": "final",
+        "action": None,
+        "final_answer": text_to_parse,
+    }
+
+
 def react_llm_think(messages: list[dict], task: str, step: int,
                     last_observation: str) -> dict:
     """
@@ -215,8 +313,9 @@ def _mock_react_think(messages: list[dict], task: str, step: int,
 
 # ── ReAct Agent 主循环 ──────────────────────────────────────
 class ReActAgent:
-    def __init__(self, human_in_loop: bool = False):
-        self.human_in_loop = human_in_loop  # 是否需要人工参与观察
+    def __init__(self, stream_mode: bool = False, human_in_loop: bool = False):
+        self.stream_mode = stream_mode
+        self.human_in_loop = human_in_loop
         self.tools = {
             "search": search,
             "read_file": read_file,
@@ -226,11 +325,19 @@ class ReActAgent:
         self.history: list[dict] = []
 
     def run(self, task: str, max_steps: int = 10) -> str:
+        mode_label = "🔄 Stream" if self.stream_mode else "📦 Batch"
         print("=" * 60)
-        print(f"🤖 ReAct Agent 启动")
+        print(f"🤖 ReAct Agent 启动  [{mode_label} 模式]")
         print(f"📋 任务: {task}")
         print("=" * 60)
 
+        if self.stream_mode:
+            return self._run_stream(task, max_steps)
+        else:
+            return self._run_batch(task, max_steps)
+
+    def _run_batch(self, task: str, max_steps: int) -> str:
+        """Batch 模式：完整生成 → 解析 → 执行"""
         observation = ""
         messages = [{"role": "system", "content": REACT_SYSTEM_PROMPT}]
 
@@ -238,53 +345,99 @@ class ReActAgent:
             print(f"\n{'─' * 40}")
             print(f"📍 Step {step}")
 
-            # ── Thought ──
             llm_response = react_llm_think(messages, task, step, observation)
             thought = llm_response["thought"]
             print(f"  💭 Thought: {thought}")
 
-            # ── 检查是否为最终答案 ──
             if llm_response["type"] == "final":
-                final_answer = llm_response["final_answer"]
-                print(f"  ✅ Final Answer: {final_answer}")
-                self._print_summary(final_answer, step)
-                return final_answer
+                print(f"  ✅ Final Answer: {llm_response['final_answer']}")
+                self._print_summary(llm_response['final_answer'], step)
+                return llm_response['final_answer']
 
-            # ── Action ──
             action = llm_response["action"]
             action_input = llm_response["action_input"]
             print(f"  🔧 Action: {action}({action_input})")
 
-            # ── Execute ──
-            tool = self.tools.get(action)
-            if not tool:
-                observation = f"错误：未知工具 '{action}'。可用工具：{list(self.tools.keys())}"
-            else:
-                observation = tool(action_input)
-
-            # ── Observation（可选人工参与） ──
-            if self.human_in_loop:
-                print(f"  🤖 工具返回: {observation}")
-                human_feedback = input(f"  👤 请输入补充观察（直接回车跳过）: ").strip()
-                if human_feedback:
-                    observation = f"{observation}\n[人工反馈] {human_feedback}"
-
+            observation = self._execute_tool(action, action_input)
             print(f"  👁️  Observation: {observation}")
 
-            # ── 记录到历史 ──
-            step_record = {
-                "step": step,
-                "thought": thought,
-                "action": action,
-                "action_input": str(action_input),
-                "observation": observation,
-            }
-            self.history.append(step_record)
+            self._record_step(step, thought, action, action_input, observation)
             messages.append({"role": "assistant", "content": f"Thought: {thought}\nAction: {action}({action_input})"})
             messages.append({"role": "user", "content": f"Observation: {observation}"})
 
         print(f"\n⚠️ 达到最大步数 {max_steps}，强制终止")
         return "任务未完成"
+
+    def _run_stream(self, task: str, max_steps: int) -> str:
+        """Stream 模式：逐 token 输出 → 检测 Action → 执行 → 注入 Observation → 继续"""
+        observation = ""
+        messages = [{"role": "system", "content": REACT_STREAM_PROMPT}]
+
+        for step in range(1, max_steps + 1):
+            print(f"\n{'─' * 40}")
+            print(f"📍 Step {step}  [🔄 Stream]")
+
+            llm_response = react_llm_stream_think(messages, task, step, observation)
+            if llm_response is None:
+                print(f"  ❌ Stream 推理失败")
+                break
+
+            thought = llm_response.get("thought", "")
+
+            if llm_response["type"] == "final":
+                self._print_summary(llm_response.get('final_answer', ''), step)
+                return llm_response.get('final_answer', '')
+
+            action = llm_response["action"]
+            action_input = llm_response["action_input"]
+            print(f"  🔧 [Stream → 执行] Action: {action}({action_input})")
+
+            observation = self._execute_tool(action, action_input)
+            print(f"  👁️  Observation: {observation}")
+
+            self._record_step(step, thought, action, action_input, observation)
+            # Stream 模式: 把 Observation 注入下一轮 System Prompt，而非拼到对话历史末尾
+            # 这样 LLM 在下一轮可以自然地从 Observation 开始推理，用户看到连续流式输出
+            messages.append({"role": "assistant", "content": thought})
+            messages.append({"role": "user", "content": f"Observation: {observation}"})
+
+        print(f"\n⚠️ 达到最大步数 {max_steps}，强制终止")
+        return "任务未完成"
+
+    def _execute_tool(self, action: str, action_input: str) -> str:
+        """执行工具并返回观察结果"""
+        tool = self.tools.get(action)
+        if not tool:
+            return f"错误：未知工具 '{action}'。可用工具：{list(self.tools.keys())}"
+
+        # 尝试解析 action_input 为 dict（JSON 格式参数），兼容纯字符串参数
+        try:
+            args = json.loads(action_input) if isinstance(action_input, str) else action_input
+            if isinstance(args, dict):
+                result = tool(**args)
+            else:
+                result = tool(action_input)
+        except (json.JSONDecodeError, TypeError):
+            result = tool(action_input)
+
+        # 人工参与
+        if self.human_in_loop:
+            print(f"  🤖 工具返回: {result}")
+            human_feedback = input(f"  👤 请输入补充观察（直接回车跳过）: ").strip()
+            if human_feedback:
+                result = f"{result}\n[人工反馈] {human_feedback}"
+
+        return result
+
+    def _record_step(self, step: int, thought: str, action: str, action_input, observation: str):
+        """记录执行步骤到历史"""
+        self.history.append({
+            "step": step,
+            "thought": thought,
+            "action": action,
+            "action_input": str(action_input),
+            "observation": observation,
+        })
 
     def _print_summary(self, result: str, steps: int):
         print(f"\n{'=' * 60}")
@@ -301,6 +454,22 @@ class ReActAgent:
 
 # ── 演示 ─────────────────────────────────────────────────────
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="ReAct Agent Demo — 支持 Batch 和 Stream 两种模式",
+    )
+    parser.add_argument("--stream", action="store_true", default=False,
+                        help="启用 Stream（流式）模式（默认 Batch 模式）")
+    parser.add_argument("--human-in-loop", action="store_true", default=False,
+                        help="启用人工参与模式")
+    parser.add_argument("--task", type=str, default=None,
+                        help="自定义任务")
+    parser.add_argument("--compare", action="store_true", default=False,
+                        help="同时运行 Batch 和 Stream 模式进行对比")
+    args = parser.parse_args()
+
+    use_stream = args.stream
+    use_human = args.human_in_loop
+
     print("""
     ╔══════════════════════════════════════════════════════╗
     ║          ReAct Agent 演示                            ║
@@ -317,24 +486,63 @@ if __name__ == "__main__":
         print("💻 未设置 OPENAI_API_KEY，使用内置规则模拟 ReAct 决策")
         print("   设置方式: export OPENAI_API_KEY=sk-xxx\n")
 
-    # ── 演示1：多步搜索和分析任务 ──
+    # ── 模式说明 ──
+    mode_label = "🔄 Stream（流式）" if use_stream else "📦 Batch（批量）"
+    print(f"  当前模式: {mode_label}")
+    print(f"  切换方式: python react_agent.py {'--no-stream' if use_stream else '--stream'}\n")
+
+    # ── Batch vs Stream 对比 ──
+    if args.compare:
+        print("=" * 60)
+        print("📌 Batch vs Stream 对比")
+        print("=" * 60)
+        task = args.task or "搜索 Python Agent 的最新信息，然后读取项目配置文件 /project/config.json"
+
+        print("\n── 📦 Batch 模式 ──")
+        agent_batch = ReActAgent(stream_mode=False, human_in_loop=False)
+        agent_batch.run(task)
+
+        print("\n\n── 🔄 Stream 模式 ──")
+        agent_stream = ReActAgent(stream_mode=True, human_in_loop=False)
+        agent_stream.run(task)
+
+        print("\n" + "=" * 60)
+        print("📊 对比总结")
+        print("=" * 60)
+        print(f"""  ┌──────────────────┬────────────────────┬──────────────────────┐
+  │                  │  📦 Batch 模式     │  🔄 Stream 模式       │
+  ├──────────────────┼────────────────────┼──────────────────────┤
+  │ LLM 输出方式      │ 完整生成后返回     │ 逐 token 实时输出     │
+  │ 用户感知          │ 等待后看到结果     │ 看到 Agent "思考"过程 │
+  │ 工具调用检测      │ 完整 JSON 解析     │ 逐 chunk 拼装后解析   │
+  │ 工程复杂度        │ 低                 │ 中（需状态管理）      │
+  │ 代表产品          │ API Playground     │ Claude Code           │
+  └──────────────────┴────────────────────┴──────────────────────┘""")
+
+        print("\n" + "=" * 60)
+        sys.exit(0)
+
+    # ── 普通演示 ──
+    task1 = args.task or "搜索 Python Agent 的最新发展，然后分析项目配置文件"
     print("\n📌 演示1：多步搜索和分析")
-    agent = ReActAgent(human_in_loop=False)
-    agent.run("搜索 Python Agent 的最新发展，然后分析项目配置文件")
+    agent = ReActAgent(stream_mode=use_stream, human_in_loop=use_human)
+    agent.run(task1)
     print(f"\n  📋 完整执行轨迹:\n{agent.export_trace()}")
 
-    # ── 演示2：计算任务（简单单步） ──
-    print("\n\n📌 演示2：简单计算任务")
-    agent2 = ReActAgent(human_in_loop=False)
-    agent2.run("(15 + 8) * 3 - 12 等于多少？")
+    # ── 演示2 ──
+    if not args.task:
+        print("\n\n📌 演示2：简单计算任务")
+        agent2 = ReActAgent(stream_mode=use_stream, human_in_loop=False)
+        agent2.run("(15 + 8) * 3 - 12 等于多少？")
 
-    # ── 演示3：人工参与模式 ──
-    print("\n\n📌 演示3：人工参与模式（Human-in-the-Loop）")
-    print("  在这个模式中，你可以在每个 Observation 之后补充反馈。")
-    choice = input("  是否启用人工参与模式？(y/n): ").strip().lower()
-    if choice == "y":
-        agent3 = ReActAgent(human_in_loop=True)
-        agent3.run("搜索最新的AI新闻")
+    # ── 演示3：人工参与 ──
+    if not args.task and not use_human:
+        print("\n\n📌 演示3：人工参与模式（Human-in-the-Loop）")
+        print("  在这个模式中，你可以在每个 Observation 之后补充反馈。")
+        choice = input("  是否启用人工参与模式？(y/n): ").strip().lower()
+        if choice == "y":
+            agent3 = ReActAgent(stream_mode=use_stream, human_in_loop=True)
+            agent3.run("搜索最新的AI新闻")
 
     print("\n" + "=" * 60)
     print("""

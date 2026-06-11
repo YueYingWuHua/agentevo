@@ -251,6 +251,21 @@ if __name__ == "__main__":
         print("💻 未设置 OPENAI_API_KEY，使用内置模拟规则演示 Agent Loop")
         print("   设置方式: export OPENAI_API_KEY=sk-xxx\n")
 
+    print("""  ┌─ 关于 Stream 模式 ──────────────────────────────────┐
+  │ 本 Demo 使用 Non-Stream（批量）模式：               │
+  │   LLM 完整生成 → 解析 Action → 执行工具 → 下一轮   │
+  │                                                     │
+  │ 对比 Stream（流式）模式：                            │
+  │   LLM 逐 token 输出 → 边输出边检测 Function Call    │
+  │   → 检测到后中断流式输出 → 执行工具 → 注入结果      │
+  │   → 恢复 LLM 继续生成                               │
+  │                                                     │
+  │ Stream 的优势：用户实时看到 Agent "思考"，           │
+  │ 不会对着空白等待。Claude Code 即采用此模式。        │
+  │ Stream 的代价：需要中断-注入-恢复的工程复杂度。      │
+  └─────────────────────────────────────────────────────┘
+  """)
+
     # 测试任务1：运行测试
     agent_loop("帮我运行所有测试文件")
 

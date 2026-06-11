@@ -134,3 +134,158 @@ def chat_structured(
 def is_available() -> bool:
     """检查真实 API 是否可用"""
     return config.use_real_api
+
+
+def chat_stream(
+    messages: list[dict],
+    model: str = None,
+    temperature: float = None,
+    max_tokens: int = None,
+):
+    """
+    流式调用 LLM API。
+
+    工作方式：
+      for token in chat_stream(messages):
+          print(token, end="", flush=True)     # 逐 token 打印
+      text, tool_calls = yield from ... 的返回值
+
+    实际实现：Generator 逐 token yield，流结束后通过 return 返回完整结果。
+
+    用法：
+      gen = chat_stream(messages)
+      for token in gen:
+          print(token, end="", flush=True)
+      full_text, tool_calls = gen.value  # 流结束后的返回值
+
+    Returns (via Generator return):
+      (accumulated_text, tool_calls_or_None)
+        - accumulated_text: 完整累积文本
+        - tool_calls: 如果 LLM 决定调工具，返回解析后的工具调用，否则为 None
+                      格式: {"name": "函数名", "arguments": "JSON参数字符串"}
+    """
+    if not config.use_real_api:
+        return _simulate_stream(messages)
+
+    yield from _real_stream(messages, model, temperature, max_tokens)
+
+
+def _real_stream(messages, model, temperature, max_tokens):
+    """真实 API 的流式调用"""
+    import requests
+
+    model = model or config.openai_model
+    temperature = temperature if temperature is not None else config.temperature
+    max_tokens = max_tokens or config.max_tokens
+
+    try:
+        resp = requests.post(
+            f"{config.openai_base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {config.openai_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "stream": True,
+            },
+            timeout=config.timeout,
+            stream=True,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  ⚠️ LLM 流式调用失败: {e}")
+        yield " [流式调用失败]"
+        return " [流式调用失败]", None
+
+    accumulated_text = ""
+    # tool_calls 拼装状态：按 index 分片合并
+    tool_call_chunks: dict[int, dict] = {}
+
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data: "):
+            continue
+        data_str = line[6:]  # 去掉 "data: " 前缀
+        if data_str == "[DONE]":
+            break
+
+        try:
+            chunk = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+
+        delta = chunk.get("choices", [{}])[0].get("delta", {})
+        finish_reason = chunk.get("choices", [{}])[0].get("finish_reason")
+
+        # ── 处理纯文本内容 ──
+        content = delta.get("content", "")
+        if content:
+            accumulated_text += content
+            yield content
+
+        # ── 处理 tool_calls 分片 ──
+        tc_list = delta.get("tool_calls")
+        if tc_list:
+            for tc in tc_list:
+                idx = tc.get("index", 0)
+                if idx not in tool_call_chunks:
+                    tool_call_chunks[idx] = {"name": "", "arguments": ""}
+
+                if tc.get("function", {}).get("name"):
+                    tool_call_chunks[idx]["name"] += tc["function"]["name"]
+                if tc.get("function", {}).get("arguments"):
+                    tool_call_chunks[idx]["arguments"] += tc["function"]["arguments"]
+
+        # ── 流结束，拼装结果 ──
+        if finish_reason:
+            if tool_call_chunks and finish_reason in ("tool_calls", "stop"):
+                tc = tool_call_chunks[0]
+                parsed_tc = {
+                    "name": tc["name"],
+                    "arguments": tc["arguments"],
+                }
+                return accumulated_text, parsed_tc
+
+    return accumulated_text, None
+
+
+def _simulate_stream(messages):
+    """
+    模拟流式输出（无 API Key 时的回退方案）。
+    从最后一条 user 消息生成一段模拟回复，逐字输出。
+    """
+    import time
+    import random
+
+    # 找最后一条 user 消息
+    last_user = ""
+    for m in reversed(messages):
+        if m["role"] == "user":
+            last_user = m["content"]
+            break
+
+    if "任务:" in last_user or "请决定" in last_user or "请开始" in last_user:
+        simulated = "我需要使用工具来完成这个任务。\n<ACTION>search</ACTION>\n<ARGS>{\"query\":\"test\"}</ARGS>"
+    else:
+        simulated = "这是一个模拟的流式回复，展示了逐字输出的效果。当配置真实的 API Key 后，这里将由 LLM 实时生成。"
+
+    accumulated = ""
+    for char in simulated:
+        accumulated += char
+        yield char
+        time.sleep(random.uniform(0.015, 0.04))
+
+    # 检测模拟文本中的 Action 标签
+    import re
+    action_match = re.search(r'<ACTION>(.*?)</ACTION>', accumulated)
+    args_match = re.search(r'<ARGS>(.*?)</ARGS>', accumulated)
+    if action_match:
+        tool_calls = {
+            "name": action_match.group(1).strip(),
+            "arguments": args_match.group(1).strip() if args_match else "{}",
+        }
+        return accumulated, tool_calls
+    return accumulated, None

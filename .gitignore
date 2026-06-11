@@ -1,1 +1,3 @@
 code/api_config.json
+__pycache__/
+.venv/

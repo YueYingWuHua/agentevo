@@ -4,7 +4,10 @@
       "Bash(python -c ' *)",
       "Bash(python -m py_compile config.py)",
       "Bash(python -m py_compile llm_client.py)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(python -m py_compile 04_react_loop/react_agent.py)",
+      "Bash(python 04_react_loop/react_agent.py --compare)",
+      "Bash(timeout 45 python 04_react_loop/react_agent.py --stream --task \"搜索Python最新版本\")"
     ]
   }
 }
