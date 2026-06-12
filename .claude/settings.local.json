@@ -7,7 +7,9 @@
       "WebSearch",
       "Bash(python -m py_compile 04_react_loop/react_agent.py)",
       "Bash(python 04_react_loop/react_agent.py --compare)",
-      "Bash(timeout 45 python 04_react_loop/react_agent.py --stream --task \"搜索Python最新版本\")"
+      "Bash(timeout 45 python 04_react_loop/react_agent.py --stream --task \"搜索Python最新版本\")",
+      "Bash(python -m py_compile 00_agent_loop/agent_loop_demo.py)",
+      "Bash(timeout 60 python 00_agent_loop/agent_loop_demo.py --mode compare)"
     ]
   }
 }

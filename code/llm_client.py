@@ -11,6 +11,83 @@
     from llm_client import chat, chat_structured
     response = chat(messages)           # 普通对话
     response = chat_structured(messages) # 要求返回JSON
+
+═══ API 格式小知识 ════════════════════════════════════════════
+
+【事实标准：OpenAI Chat Completions 协议】
+  目前几乎所有 LLM 厂商的 API 都"兼容 OpenAI 接口"。
+  这不是任何官方标准（没有 RFC、ISO、W3C），而是市场形成的
+  事实标准（de facto standard）：OpenAI 先定义了这套格式，
+  DeepSeek/智谱/阿里百炼/Moonshot/本地 Ollama 都主动兼容。
+  开发者只需改 base_url 就能切换厂商。
+
+【请求格式】 POST {base_url}/chat/completions
+{
+  "model": "deepseek-v4-flash",           // 模型名称，各厂商不同
+  "messages": [                       // 对话历史，必填
+    {"role": "system", "content": "你是一只猫娘"},   // system: 系统指令
+    {"role": "user",   "content": "你好"},       // user: 用户消息
+    {"role": "assistant", "content": "你好！"},  // assistant: 模型回复
+    {"role": "tool",   "content": "...",         // tool: 工具执行结果
+                       "tool_call_id": "xxx"}
+  ],
+  "temperature": 0.7,                 // 采样温度 0-2，越高越随机
+  "max_tokens": 2048,                 // 最大输出 token 数
+  "stream": false,                    // 是否流式返回
+  "tools": [...],                     // 工具 Schema（Function Calling）
+  "tool_choice": "auto"               // 工具选择策略
+}
+
+【响应格式】 JSON
+{
+  "id": "chatcmpl-xxx",               // 本次请求的唯一 ID
+  "object": "chat.completion",        // 固定值，标识响应类型
+  "created": 1710000000,              // Unix 时间戳
+  "model": "deepseek-chat",           // 实际使用的模型名
+
+  "choices": [                        // 候选回复列表（通常取第一个）
+    {
+      "index": 0,                     // 候选序号
+      "message": {                    // 模型回复
+        "role": "assistant",          // 固定为 "assistant"
+        "content": "回复文本",         // 自然语言回复（可能为 null）
+        "tool_calls": [               // 工具调用（模型决定调工具时出现）
+          {
+            "id": "call_xxx",         // 本次调用的唯一 ID
+            "type": "function",       // 固定为 "function"
+            "function": {
+              "name": "search",       // 工具名
+              "arguments": "{\"q\":\"x\"}"  // 参数，JSON 字符串
+            }
+          }
+        ]
+      },
+      "finish_reason": "stop"         // 结束原因：
+    }                                 //   "stop"        — 自然结束
+  ],                                  //   "tool_calls"  — 需要调工具
+                                      //   "length"      — 达到 max_tokens
+  "usage": {                          //   "content_filter" — 内容过滤
+    "prompt_tokens": 150,             // 输入消耗的 token 数
+    "completion_tokens": 80,          // 输出消耗的 token 数
+    "total_tokens": 230               // 总计 token 数
+  }
+}
+
+【Stream 模式响应】 SSE (Server-Sent Events)
+  每行格式: data: {JSON}\n\n
+  data: {"choices":[{"delta":{"content":"你"}}]}
+  data: {"choices":[{"delta":{"content":"好"}}]}
+  data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+  data: [DONE]                        ← 流结束标记
+  -----------------------------------------------------------------
+  关键区别: 非 stream 返回整个 message，stream 返回增量 delta。
+  tool_calls 在 stream 模式下按 index 分片传输，需客户端拼装。
+
+【实际验证方式】
+  如需查看原始响应，可在 llm_client.py 的 chat() 函数中临时
+  取消注释调试打印: print(resp.text)
+
+════════════════════════════════════════════════════════════════
 """
 
 import json
@@ -66,6 +143,7 @@ def chat(
             timeout=config.timeout,
         )
         resp.raise_for_status()
+        print("resp => " + resp.text + "\n\n\n\n")
         data = resp.json()
         return data["choices"][0]["message"]["content"]
     except Exception as e:
@@ -100,9 +178,9 @@ def chat_structured(
         structured_messages.insert(0, {"role": "system", "content": f"你必须输出有效的 JSON。{json_hint}"})
 
     raw = chat(structured_messages, model=model, temperature=temperature if temperature is not None else 0.3)
+    print("raw => " + raw + "\n\n\n\n")
     if raw is None:
         return None
-
     # 尝试直接解析
     try:
         return json.loads(raw)
@@ -134,6 +212,81 @@ def chat_structured(
 def is_available() -> bool:
     """检查真实 API 是否可用"""
     return config.use_real_api
+
+
+def chat_with_tools(
+    messages: list[dict],
+    tools: list[dict],
+    model: str = None,
+    temperature: float = None,
+    max_tokens: int = None,
+) -> tuple[str | None, dict | None]:
+    """
+    使用 API 原生 tools 参数进行对话（即 Function Calling）。
+
+    与 chat_structured() 的关键区别：
+      - chat_structured(): 在 Prompt 中要求 LLM 输出 JSON → 依赖注意力维持
+      - chat_with_tools(): 将工具 Schema 传给 API 的 tools 参数 → 模型训练级支持
+
+    Args:
+        messages: 消息列表
+        tools: 工具 Schema 列表，OpenAI 格式 [{"type":"function","function":{...}}]
+        model/temperature/max_tokens: 同 chat()
+
+    Returns:
+        (content_text, tool_call_or_None)
+          - content_text: LLM 的自然语言回复（可能为 None 如果只调了工具）
+          - tool_call: {"name": "...", "arguments": {...}} 或 None
+    """
+    if not config.use_real_api:
+        return None, None
+
+    import requests
+
+    model = model or config.openai_model
+    temperature = temperature if temperature is not None else config.temperature
+    max_tokens = max_tokens or config.max_tokens
+
+    try:
+        resp = requests.post(
+            f"{config.openai_base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {config.openai_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "tools": tools,
+                "tool_choice": "auto",
+            },
+            timeout=config.timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        print("resp => " + resp.text + "\n\n\n\n")
+        choice = data["choices"][0]
+        message = choice.get("message", {})
+
+        content = message.get("content")  # 自然语言文本
+        tool_calls = message.get("tool_calls")  # 工具调用（原生 FC）
+
+        if tool_calls:
+            tc = tool_calls[0]
+            func = tc.get("function", {})
+            parsed = {
+                "name": func.get("name", ""),
+                "arguments": json.loads(func.get("arguments", "{}")),
+            }
+            return content, parsed
+
+        return content, None
+
+    except Exception as e:
+        print(f"  ⚠️ LLM tools 调用失败: {e}")
+        return None, None
 
 
 def chat_stream(
